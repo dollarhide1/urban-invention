@@ -1873,6 +1873,7 @@
     input, textarea { user-select: text; -webkit-user-select: text; }
   }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
 
@@ -3837,6 +3838,382 @@ loadState();
 applyTheme(getTheme());
 renderAll();
 maybeShowInstallBanner();
+
+// ===================================================================
+//  SHARED BOOK CLUB — Supabase wiring (auth + clubs + subscription)
+//  Added by Claude. This OVERRIDES the local club functions above with
+//  live, multi-user versions backed by Supabase. The personal library
+//  (books, quotes, habits, goal) is untouched and still local.
+// ===================================================================
+;(function () {
+  const SUPABASE_URL = 'https://hhepgcyqtdohdnqqxssa.supabase.co';
+  const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhoZXBnY3lxdGRvaGRucXF4c3NhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI1OTc3MzgsImV4cCI6MjA5ODE3MzczOH0.QWWTEM8HbJtuWpK9YV6rVWC6W_AZZ3s3Z_ewUfZEJ9Q';
+  const MAX_MEMBERS = 4;
+
+  if (!window.supabase || !window.supabase.createClient) {
+    console.warn('[club] Supabase library not loaded — club stays in local mode.');
+    return;
+  }
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  const live = { user: null, subscribed: false, clubs: [], notice: '' };
+
+  const esc = (s) => escapeHtml(String(s == null ? '' : s));
+  function rerender() { if (state.activeTab === 'club') renderMain(); }
+  function setNotice(msg) { live.notice = msg || ''; rerender(); }
+
+  // ---------- data loading ----------
+  async function ensureProfile() {
+    if (!live.user) return;
+    const fallback = (live.user.email || 'Reader').split('@')[0];
+    await sb.from('profiles').upsert(
+      { id: live.user.id, display_name: fallback },
+      { onConflict: 'id', ignoreDuplicates: true }
+    );
+  }
+
+  async function loadSubscription() {
+    if (!live.user) { live.subscribed = false; return; }
+    const { data } = await sb.from('subscriptions')
+      .select('status').eq('user_id', live.user.id).maybeSingle();
+    live.subscribed = !!(data && data.status === 'active');
+  }
+
+  async function loadClubs() {
+    live.clubs = [];
+    if (!live.user) { state.bookClubs = live.clubs; return; }
+    const { data: clubs, error } = await sb.from('clubs')
+      .select('id,name,description,current_book,owner_id,join_code,created_at')
+      .order('created_at', { ascending: true });
+    if (error || !clubs || !clubs.length) { state.bookClubs = live.clubs; return; }
+    const ids = clubs.map((c) => c.id);
+
+    const [{ data: members }, { data: meetings }, { data: discussions }] = await Promise.all([
+      sb.from('club_members').select('club_id,user_id,role').in('club_id', ids),
+      sb.from('meetings').select('id,club_id,meeting_date,book,notes').in('club_id', ids),
+      sb.from('discussions').select('id,club_id,user_id,text,created_at').in('club_id', ids),
+    ]);
+
+    const memberIds = [...new Set((members || []).map((m) => m.user_id))];
+    const names = {};
+    if (memberIds.length) {
+      const { data: profs } = await sb.from('profiles')
+        .select('id,display_name').in('id', memberIds);
+      (profs || []).forEach((p) => { names[p.id] = p.display_name; });
+    }
+
+    live.clubs = clubs.map((c) => ({
+      id: c.id,
+      name: c.name,
+      description: c.description || '',
+      currentBook: c.current_book || '',
+      joinCode: c.join_code,
+      ownerId: c.owner_id,
+      isOwner: c.owner_id === live.user.id,
+      members: (members || []).filter((m) => m.club_id === c.id)
+        .map((m) => ({ id: m.user_id, name: names[m.user_id] || 'Member', role: m.role })),
+      meetings: (meetings || []).filter((m) => m.club_id === c.id)
+        .map((m) => ({ id: m.id, date: m.meeting_date, book: m.book, notes: m.notes })),
+      discussions: (discussions || []).filter((d) => d.club_id === c.id)
+        .map((d) => ({ id: d.id, text: d.text, date: d.created_at, userId: d.user_id })),
+    }));
+    state.bookClubs = live.clubs; // bridge so the edit modal can find clubs
+  }
+
+  async function reloadAll() { await loadSubscription(); await loadClubs(); rerender(); }
+
+  // ---------- realtime (best effort) ----------
+  let reloadTimer = null;
+  function scheduleReload() {
+    clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => { loadClubs().then(rerender); }, 400);
+  }
+  function subscribeRealtime() {
+    ['discussions', 'meetings', 'club_members'].forEach((tbl) => {
+      sb.channel('rt-' + tbl)
+        .on('postgres_changes', { event: '*', schema: 'public', table: tbl }, scheduleReload)
+        .subscribe();
+    });
+  }
+
+  // ---------- auth ----------
+  window.rrSignIn = async function () {
+    const el = document.getElementById('rr-email');
+    const email = el && el.value.trim();
+    if (!email) { setNotice('Enter your email first.'); return; }
+    setNotice('Sending…');
+    const { error } = await sb.auth.signInWithOtp({
+      email, options: { emailRedirectTo: location.origin + '/app' },
+    });
+    setNotice(error ? ('Could not send link: ' + error.message)
+                    : 'Check your inbox — tap the link to sign in.');
+  };
+  window.rrSignOut = async function () {
+    await sb.auth.signOut();
+    live.user = null; live.subscribed = false; live.clubs = []; state.bookClubs = [];
+    rerender();
+  };
+
+  // ---------- subscription ----------
+  window.rrSubscribe = async function () {
+    const { data: { session } } = await sb.auth.getSession();
+    if (!session) { setNotice('Please sign in first.'); return; }
+    try {
+      const res = await fetch('/.netlify/functions/create-checkout-session', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + session.access_token },
+      });
+      const out = await res.json();
+      if (out && out.url) location.href = out.url;
+      else alert('Could not start checkout. Check that the Stripe keys are set in Netlify.');
+    } catch (e) { alert('Checkout error: ' + e.message); }
+  };
+  window.rrRefresh = async function () { await reloadAll(); };
+
+  // ---------- join by code ----------
+  window.rrJoin = async function () {
+    const el = document.getElementById('rr-join-code');
+    const code = el && el.value.trim();
+    if (!code) return;
+    const { error } = await sb.rpc('join_club_by_code', { p_code: code });
+    if (error) { alert(error.message || 'Could not join that club.'); return; }
+    if (el) el.value = '';
+    await loadClubs(); rerender();
+  };
+
+  // ---------- create / edit / delete ----------
+  window.submitClub = async function (id) {
+    const name = document.getElementById('f-name').value.trim();
+    const description = document.getElementById('f-desc').value.trim();
+    const currentBook = document.getElementById('f-current').value.trim();
+    if (!name) { alert('Name is required.'); return; }
+    if (id) {
+      const { error } = await sb.from('clubs')
+        .update({ name, description, current_book: currentBook }).eq('id', id);
+      if (error) { alert(error.message); return; }
+    } else {
+      const { error } = await sb.rpc('create_club', {
+        p_name: name, p_description: description, p_current_book: currentBook,
+      });
+      if (error) { alert(error.message || 'Could not create club.'); return; }
+    }
+    closeModal();
+    await loadClubs(); rerender();
+  };
+
+  window.deleteClub = async function (id) {
+    if (!confirm('Delete this club for everyone?')) return;
+    const { error } = await sb.from('clubs').delete().eq('id', id);
+    if (error) { alert(error.message); return; }
+    await loadClubs(); rerender();
+  };
+
+  // ---------- meetings ----------
+  window.addMeeting = async function (clubId) {
+    const date = (document.getElementById('meeting-date-' + clubId) || {}).value;
+    const book = (document.getElementById('meeting-book-' + clubId) || {}).value;
+    const notes = (document.getElementById('meeting-notes-' + clubId) || {}).value;
+    if (!date) { alert('Please select a date'); return; }
+    const { error } = await sb.from('meetings')
+      .insert({ club_id: clubId, meeting_date: date, book: book, notes: notes, created_by: live.user.id });
+    if (error) { alert(error.message); return; }
+    await loadClubs(); rerender();
+  };
+  window.removeMeeting = async function (clubId, meetingId) {
+    await sb.from('meetings').delete().eq('id', meetingId);
+    await loadClubs(); rerender();
+  };
+
+  // ---------- discussions ----------
+  window.addDiscussion = async function (clubId) {
+    const el = document.getElementById('discussion-input-' + clubId);
+    const text = el && el.value.trim();
+    if (!text) return;
+    const { error } = await sb.from('discussions')
+      .insert({ club_id: clubId, user_id: live.user.id, text: text });
+    if (error) { alert(error.message); return; }
+    await loadClubs(); rerender();
+  };
+  window.removeDiscussion = async function (clubId, discId) {
+    await sb.from('discussions').delete().eq('id', discId);
+    await loadClubs(); rerender();
+  };
+
+  // ---------- members ----------
+  window.addMember = function () {
+    alert("Members join by entering this club's invite code on their own device.");
+  };
+  window.removeMember = async function (clubId, userId) {
+    if (!confirm('Remove this member?')) return;
+    await sb.from('club_members').delete().eq('club_id', clubId).eq('user_id', userId);
+    await loadClubs(); rerender();
+  };
+
+  // ---------- rendering ----------
+  window.renderClub = function () {
+    if (!live.user) {
+      return `
+        <div class="section-header">
+          <div><h2 class="section-title">Book Club</h2>
+          <p class="section-subtitle">Reading is better together</p></div>
+        </div>
+        <div class="dash-card" style="max-width:460px;">
+          <h3 class="dash-card-title">Sign in to your club</h3>
+          <p style="font-family:'Inter',sans-serif;font-size:0.85rem;color:var(--steel);margin:.2rem 0 .9rem;">Enter your email and we'll send a one-tap sign-in link. No password needed.</p>
+          <div class="inline-form">
+            <input type="email" class="input" id="rr-email" placeholder="you@email.com" onkeydown="if(event.key==='Enter')rrSignIn()">
+            <button class="btn-primary" onclick="rrSignIn()">Email me a link</button>
+          </div>
+          ${live.notice ? `<p style="font-family:'Inter',sans-serif;font-size:0.82rem;color:var(--steel);margin-top:.7rem;">${esc(live.notice)}</p>` : ''}
+        </div>`;
+    }
+    if (!live.subscribed) {
+      return `
+        <div class="section-header">
+          <div><h2 class="section-title">Book Club</h2>
+          <p class="section-subtitle">Signed in as ${esc(live.user.email)}</p></div>
+          <button class="btn-secondary" onclick="rrSignOut()">Sign out</button>
+        </div>
+        <div class="empty">
+          <div class="empty-icon">🔓</div>
+          <p class="empty-msg">A membership unlocks the shared club — create or join a club of up to ${MAX_MEMBERS} readers.</p>
+          <button class="btn-primary" onclick="rrSubscribe()">Subscribe</button>
+          <p style="font-family:'Inter',sans-serif;font-size:0.8rem;color:var(--steel);margin-top:.8rem;">Already subscribed? <a href="#" onclick="rrRefresh();return false;">Refresh</a></p>
+        </div>`;
+    }
+    return `
+      <div class="section-header">
+        <div><h2 class="section-title">Book Club</h2>
+        <p class="section-subtitle">Signed in as ${esc(live.user.email)}</p></div>
+        <button class="btn-secondary" onclick="rrSignOut()">Sign out</button>
+      </div>
+      <div class="inline-form" style="margin-bottom:1rem;">
+        <input type="text" class="input" id="rr-join-code" placeholder="Enter a club code to join…" onkeydown="if(event.key==='Enter')rrJoin()">
+        <button class="btn-secondary" onclick="rrJoin()">Join</button>
+        <button class="btn-primary" onclick="openModal('club')">+ New Club</button>
+      </div>
+      ${live.clubs.length === 0 ? `
+        <div class="empty">
+          <div class="empty-icon">👥</div>
+          <p class="empty-msg">No clubs yet. Create one, or join with a friend's code.</p>
+        </div>` : `
+        <div class="club-list">${live.clubs.map((c) => renderClubCardLive(c)).join('')}</div>`}`;
+  };
+
+  function renderClubCardLive(c) {
+    const tab = state.clubTabs[c.id] || 'overview';
+    const full = c.members.length >= MAX_MEMBERS;
+    return `
+      <div class="club-card">
+        <div class="club-header">
+          <div>
+            <h3 class="club-name">${esc(c.name)}</h3>
+            ${c.description ? `<p class="club-desc">${esc(c.description)}</p>` : ''}
+            <p class="club-meta">${c.members.length}/${MAX_MEMBERS} member${c.members.length !== 1 ? 's' : ''} · ${c.meetings.length} meeting${c.meetings.length !== 1 ? 's' : ''}${full ? ' · full' : ''}</p>
+          </div>
+          ${c.isOwner ? `<div class="book-actions">
+            <button class="icon-btn" onclick="openModal('club','${c.id}')">✎</button>
+            <button class="icon-btn" onclick="deleteClub('${c.id}')">🗑</button>
+          </div>` : ''}
+        </div>
+        <div class="club-tabs">
+          ${['overview', 'members', 'meetings', 'discussions'].map((t) => `
+            <button class="club-tab ${tab === t ? 'active' : ''}" onclick="setClubTab('${c.id}','${t}')">${t.charAt(0).toUpperCase() + t.slice(1)}</button>
+          `).join('')}
+        </div>
+        <div class="club-body">${renderClubBodyLive(c, tab)}</div>
+      </div>`;
+  }
+
+  function renderClubBodyLive(c, tab) {
+    if (tab === 'overview') {
+      return `
+        <div class="club-stats">
+          <div class="club-stat"><strong>${c.members.length}</strong><span>Members</span></div>
+          <div class="club-stat"><strong>${c.meetings.length}</strong><span>Meetings</span></div>
+          <div class="club-stat"><strong>${c.discussions.length}</strong><span>Discussions</span></div>
+        </div>
+        ${c.currentBook ? `<div class="club-current">
+          <p class="club-current-label">Currently reading</p>
+          <p class="club-current-book">${esc(c.currentBook)}</p></div>` : ''}
+        <div class="club-current" style="margin-top:.8rem;">
+          <p class="club-current-label">Invite code</p>
+          <p class="club-current-book" style="letter-spacing:.12em;">${esc(c.joinCode)}</p>
+          <p style="font-family:'Inter',sans-serif;font-size:0.78rem;color:var(--steel);margin-top:.2rem;">Share this so others can join (up to ${MAX_MEMBERS}).</p>
+        </div>`;
+    }
+    if (tab === 'members') {
+      return `
+        <div class="member-list">
+          ${c.members.map((m) => `
+            <div class="member-item">
+              <div class="member-avatar">${esc((m.name[0] || '?').toUpperCase())}</div>
+              <span style="flex:1;">${esc(m.name)}${m.role === 'owner' ? ' · owner' : ''}</span>
+              ${c.isOwner && m.id !== c.ownerId ? `<button class="icon-btn" onclick="removeMember('${c.id}','${m.id}')">×</button>` : ''}
+            </div>`).join('')}
+        </div>
+        <p style="font-family:'Inter',sans-serif;font-size:0.8rem;color:var(--steel);margin-top:.6rem;">New members join by entering this club's code: <strong>${esc(c.joinCode)}</strong></p>`;
+    }
+    if (tab === 'meetings') {
+      return `
+        <div class="form-grid">
+          <div class="field"><label class="field-label">Date</label><input type="date" class="input" id="meeting-date-${c.id}"></div>
+          <div class="field"><label class="field-label">Book</label><input type="text" class="input" id="meeting-book-${c.id}"></div>
+          <div class="field full"><label class="field-label">Notes</label><textarea class="input" id="meeting-notes-${c.id}"></textarea></div>
+        </div>
+        <button class="btn-primary" onclick="addMeeting('${c.id}')">Schedule Meeting</button>
+        <div class="meeting-list">
+          ${[...c.meetings].sort((a, b) => new Date(b.date) - new Date(a.date)).map((m) => `
+            <div class="meeting-item">
+              <div class="meeting-date">
+                <p class="meeting-day">${new Date(m.date).getDate()}</p>
+                <p class="meeting-month">${new Date(m.date).toLocaleDateString('en', { month: 'short' })}</p>
+              </div>
+              <div class="meeting-content">
+                ${m.book ? `<p class="meeting-book">${esc(m.book)}</p>` : ''}
+                ${m.notes ? `<p class="meeting-notes">${esc(m.notes)}</p>` : ''}
+              </div>
+              <button class="icon-btn" onclick="removeMeeting('${c.id}','${m.id}')">🗑</button>
+            </div>`).join('')}
+        </div>`;
+    }
+    if (tab === 'discussions') {
+      return `
+        <div class="inline-form">
+          <textarea class="input" id="discussion-input-${c.id}" placeholder="Start a discussion thread..." style="min-height:70px;"></textarea>
+          <button class="btn-primary" onclick="addDiscussion('${c.id}')">Post</button>
+        </div>
+        <div class="discussion-list">
+          ${[...c.discussions].reverse().map((d) => `
+            <div class="discussion-item">
+              <p class="discussion-text">${esc(d.text)}</p>
+              <div class="discussion-footer">
+                <span class="discussion-date">${new Date(d.date).toLocaleDateString('en', { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                ${(d.userId === live.user.id || c.isOwner) ? `<button class="icon-btn" onclick="removeDiscussion('${c.id}','${d.id}')">🗑</button>` : ''}
+              </div>
+            </div>`).join('')}
+        </div>`;
+    }
+    return '';
+  }
+
+  // ---------- boot ----------
+  sb.auth.onAuthStateChange((_event, session) => {
+    const u = session ? session.user : null;
+    const was = live.user ? live.user.id : null;
+    live.user = u;
+    if (u && u.id !== was) { ensureProfile().then(reloadAll); }
+    else if (!u) { live.subscribed = false; live.clubs = []; state.bookClubs = []; rerender(); }
+  });
+
+  (async function init() {
+    const { data: { session } } = await sb.auth.getSession();
+    live.user = session ? session.user : null;
+    if (live.user) { await ensureProfile(); await reloadAll(); }
+    subscribeRealtime();
+    rerender();
+  })();
+})();
+
 </script>
 </body>
 </html>
